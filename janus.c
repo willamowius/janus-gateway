@@ -4581,6 +4581,21 @@ gint main(int argc, char *argv[])
 	if(item && item->value) {
 		JANUS_LOG(LOG_INFO, "Using nat_1_1_mapping for public IP: %s\n", item->value);
 		if(!janus_network_string_is_valid_address(janus_network_query_options_any_ip, item->value)) {
+            // assume its a DNS name, do a lookup
+            struct hostent *host = gethostbyname(item->value);
+            if (host) {
+                char * new_ip = g_malloc(INET6_ADDRSTRLEN);
+                if (inet_ntop(AF_INET, host->h_addr, new_ip, INET6_ADDRSTRLEN)) {
+                    // rewrite the config entry
+                    janus_config_remove(config, config_nat, "nat_1_1_mapping");
+                    janus_config_add(config, config_nat, janus_config_item_create("nat_1_1_mapping", new_ip));
+                    item = janus_config_get(config, config_nat, janus_config_type_item, "nat_1_1_mapping");
+                    JANUS_LOG(LOG_INFO, "DNS for nat_1_1_mapping resolves to IP: %s\n", item->value);
+                }
+                g_free(new_ip);
+            }
+        }
+		if(!janus_network_string_is_valid_address(janus_network_query_options_any_ip, item->value)) {
 			JANUS_LOG(LOG_WARN, "Invalid nat_1_1_mapping address %s, disabling...\n", item->value);
 		} else {
 			nat_1_1_mapping = item->value;
