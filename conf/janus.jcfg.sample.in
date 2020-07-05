@@ -263,7 +263,12 @@ nat: {
 	# then set the 'keep_private_host' property to true.
 	# If the config value doesn't have the format of an IP address,
 	# Janus will perform a DNS lookup at startup to resolve the name to an IP.
+	# If the config value is set to one of "AlibabaPublicIP", "AWSPublicIP",
+	# "AzurePublicIP" or "GooglePublicIP", Janus will automatically look up
+	# the external IP within those cloud services at startup.
 	#nat_1_1_mapping = "1.2.3.4"
+	#nat_1_1_mapping = "AWSPublicIP"
+	#nat_1_1_mapping = "janus.example.com"
 	#keep_private_host = true
 
 	# You can configure a TURN server in two different ways: specifying a

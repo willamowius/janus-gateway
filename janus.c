@@ -25,7 +25,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <poll.h>
-#ifdef HAVE_TURNRESTAPI
+#ifdef HAVE_LIBCURL
 #include <curl/curl.h>
 #endif
 
@@ -329,7 +329,7 @@ static json_t *janus_info(const char *transaction) {
 		json_object_set_new(deps, "jansson", json_string(JANSSON_VERSION));
 		json_object_set_new(deps, "libnice", json_string(libnice_version_string));
 		json_object_set_new(deps, "libsrtp", json_string(srtp_get_version_string()));
-	#ifdef HAVE_TURNRESTAPI
+	#ifdef HAVE_LIBCURL
 		curl_version_info_data *curl_version = curl_version_info(CURLVERSION_NOW);
 		if(curl_version && curl_version->version)
 			json_object_set_new(deps, "libcurl", json_string(curl_version->version));
@@ -3859,6 +3859,60 @@ gboolean janus_plugin_auth_signature_contains(janus_plugin *plugin, const char *
 	return janus_auth_check_signature_contains(token, plugin->get_package(), descriptor);
 }
 
+#ifdef HAVE_LIBCURL
+/* Buffer we use to receive the response via libcurl */
+typedef struct janus_libcurl_buffer {
+	char *buffer;
+	size_t size;
+} janus_libcurl_buffer;
+
+static size_t janus_libcurl_write_data(void *payload, size_t size, size_t nmemb, void *data) {
+	size_t realsize = size * nmemb;
+	janus_libcurl_buffer *buf = (struct janus_libcurl_buffer *)data;
+	/* (Re)allocate if needed */
+	buf->buffer = g_realloc(buf->buffer, buf->size+realsize+1);
+	/* Update the buffer */
+	memcpy(&(buf->buffer[buf->size]), payload, realsize);
+	buf->size += realsize;
+	buf->buffer[buf->size] = 0;
+	return realsize;
+}
+
+static gboolean http_ip_lookup(const char * url, const char * extra_header, char * ip) {
+    CURLcode res = CURLE_FAILED_INIT;
+    //curl_global_init(CURL_GLOBAL_ALL);
+    CURL *curl = curl_easy_init();
+    if (curl) {
+        janus_libcurl_buffer data;
+        data.buffer = g_malloc0(1);
+        data.size = 0;
+        struct curl_slist *headers = NULL;
+        if (extra_header) {
+            headers = curl_slist_append(headers, extra_header);
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        }
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, janus_libcurl_write_data);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        CURLcode res = curl_easy_perform(curl);
+        if (res == CURLE_OK) {
+            // trim trailing whitespace
+            char * end = data.buffer + strlen(data.buffer) - 1;
+            while(end > data.buffer && isspace((unsigned char)*end)) end--;
+            end[1] = '\0'; // write new null terminator character
+            if (janus_network_string_is_valid_address(janus_network_query_options_any_ip, data.buffer)) {
+                strncpy(ip, data.buffer, INET6_ADDRSTRLEN);
+            }
+        }
+        g_free(data.buffer);
+        if (extra_header) {
+            curl_slist_free_all(headers);
+        }
+        curl_easy_cleanup(curl);
+    }
+    return (res == CURLE_OK);
+}
+#endif // HAVE_LIBCURL
 
 /* Main */
 gint main(int argc, char *argv[])
@@ -4581,18 +4635,35 @@ gint main(int argc, char *argv[])
 	if(item && item->value) {
 		JANUS_LOG(LOG_INFO, "Using nat_1_1_mapping for public IP: %s\n", item->value);
 		if(!janus_network_string_is_valid_address(janus_network_query_options_any_ip, item->value)) {
-            // assume its a DNS name, do a lookup
-            struct hostent *host = gethostbyname(item->value);
-            if (host) {
-                char * new_ip = g_malloc(INET6_ADDRSTRLEN);
-                if (inet_ntop(AF_INET, host->h_addr, new_ip, INET6_ADDRSTRLEN)) {
-                    // rewrite the config entry
-                    janus_config_remove(config, config_nat, "nat_1_1_mapping");
-                    janus_config_add(config, config_nat, janus_config_item_create("nat_1_1_mapping", new_ip));
-                    item = janus_config_get(config, config_nat, janus_config_type_item, "nat_1_1_mapping");
-                    JANUS_LOG(LOG_INFO, "DNS for nat_1_1_mapping resolves to IP: %s\n", item->value);
+            char new_ip[INET6_ADDRSTRLEN];
+            bzero(new_ip, sizeof(new_ip));
+#ifdef HAVE_LIBCURL
+            // check if we should do cloud IP lookup
+			if (strcmp(item->value, "AlibabaPublicIP") == 0) {
+                http_ip_lookup("http://100.100.100.200/latest/meta-data/eipv4", NULL, new_ip);
+			} else if (strcmp(item->value, "AWSPublicIP") == 0) {
+                http_ip_lookup("http://169.254.169.254/latest/meta-data/public-ipv4", NULL, new_ip);
+			} else if (strcmp(item->value, "AzurePublicIP") == 0) {
+                http_ip_lookup("http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2017-08-01&format=text", "Metadata: true", new_ip);
+			} else if (strcmp(item->value, "GooglePublicIP") == 0) {
+                http_ip_lookup("http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip", "Metadata-Flavor: Google", new_ip);
+            } else
+#endif
+            {
+                // assume its a DNS name, do a lookup
+                struct hostent *host = gethostbyname(item->value);
+                if (host) {
+                    if (inet_ntop(AF_INET, host->h_addr, new_ip, INET6_ADDRSTRLEN)) {
+                        JANUS_LOG(LOG_INFO, "DNS for nat_1_1_mapping resolves to IP: %s\n", new_ip);
+                    }
                 }
-                g_free(new_ip);
+            }
+            if (strlen(new_ip) > 0) {
+                // replace config entry
+                janus_config_remove(config, config_nat, "nat_1_1_mapping");
+                janus_config_add(config, config_nat, janus_config_item_create("nat_1_1_mapping", new_ip));
+                item = janus_config_get(config, config_nat, janus_config_type_item, "nat_1_1_mapping");
+                JANUS_LOG(LOG_INFO, "Entry for nat_1_1_mapping updated to IP: %s\n", item->value);
             }
         }
 		if(!janus_network_string_is_valid_address(janus_network_query_options_any_ip, item->value)) {
